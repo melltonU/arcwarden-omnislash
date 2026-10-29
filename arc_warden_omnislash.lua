@@ -324,6 +324,10 @@ local localization = qLocalization.new({
 		aw_ally = "Protect allies",
 		aw_ally_tip = "When enabled, protect the confirmed Omnislash target.\nWhen disabled, protect Arc Warden only when he is the confirmed target.",
 		aw_gear_extra = "Options",
+		aw_delay = "Field delay",
+		aw_delay_tip = "Wait this long after Omnislash is detected before casting Magnetic Field. 0 disables the delay.",
+		aw_double_delay = "Delay before clone field",
+		aw_double_delay_tip = "Wait this long after Arc Warden casts his field before the Tempest Double casts.",
 		aw_debug = "Debug log",
 		aw_debug_tip = "Logs when the script activates, Magnetic Field becomes available, and an enemy Juggernaut starts Omnislash",
 	},
@@ -334,6 +338,10 @@ local localization = qLocalization.new({
 		aw_ally = "Защищать союзников",
 		aw_ally_tip = "Если включено, защищает подтверждённую цель Омнислеша.\nЕсли выключено, защищает Арка только когда он точно является целью.",
 		aw_gear_extra = "Настройки",
+		aw_delay = "Задержка купола",
+		aw_delay_tip = "Пауза после обнаружения Омнислеша перед постановкой купола. 0 отключает задержку.",
+		aw_double_delay = "Пауза перед куполом копии",
+		aw_double_delay_tip = "Сколько ждать после купола настоящего Арка перед куполом Tempest Double.",
 		aw_debug = "Отладка в лог",
 		aw_debug_tip = "Пишет в лог включение скрипта, готовность купола и обнаружение начала Омнислеша",
 	},
@@ -359,6 +367,10 @@ do
 	ui.ally = group:Switch("aw_ally", false, "\u{f05b}")
 	ui.ally:ToolTip("aw_ally_tip")
 	local gear = ui.enable:Gear("aw_gear_extra")
+	ui.delay = gear:Slider("aw_delay", 0, 1000, 300, "%d ms")
+	ui.delay:ToolTip("aw_delay_tip")
+	ui.double_delay = gear:Slider("aw_double_delay", 0, 1000, 250, "%d ms")
+	ui.double_delay:ToolTip("aw_double_delay_tip")
 	ui.debug = gear:Switch("aw_debug", true, "\u{f188}")
 	ui.debug:ToolTip("aw_debug_tip")
 end
@@ -370,6 +382,8 @@ end
 local function refresh_disabled()
 	local on = active()
 	ui.ally:Disabled(not on)
+	ui.delay:Disabled(not on)
+	ui.double_delay:Disabled(not on)
 	ui.debug:Disabled(not on)
 end
 
@@ -528,7 +542,7 @@ function script.OnUpdate()
 					))
 					local window = Ability.GetCastPoint(omnislash)
 						+ Ability.GetLevelSpecialValueFor(omnislash, "duration")
-					local delay = cast_count > 1 and 0.3 or 0
+					local delay = ui.delay:Get() / 1000
 					event = {
 						cast_at = now + delay,
 						expires_at = now + delay + window + 0.25,
@@ -536,6 +550,9 @@ function script.OnUpdate()
 						target = target,
 						target_resolved = target_source == "other_target",
 						hero_cast = false,
+						double_cast_at = nil,
+						double_base_position = nil,
+						double_forward = nil,
 						double_cast = false,
 					}
 					state.omni_events[enemy_index] = event
@@ -611,6 +628,9 @@ function script.OnUpdate()
 						if cast_range > 0 and cast_distance <= cast_range then
 							Ability.CastPosition(field, back_position)
 							event.hero_cast = true
+							event.double_cast_at = now + ui.double_delay:Get() / 1000
+							event.double_base_position = target_position
+							event.double_forward = forward
 							log("Cast Magnetic Field behind Omnislash target")
 						elseif event.hero_status ~= "out_of_range" then
 							event.hero_status = "out_of_range"
@@ -622,7 +642,7 @@ function script.OnUpdate()
 						end
 					end
 
-					if not event.double_cast then
+					if event.hero_cast and now >= event.double_cast_at and not event.double_cast then
 						local owner = Entity.RecursiveGetOwner(hero)
 						local double_found = false
 						local double_issue = nil
@@ -644,7 +664,8 @@ function script.OnUpdate()
 										double_issue = "unavailable"
 									else
 										local double_radius = Ability.GetLevelSpecialValueFor(double_field, "radius")
-										local front_position = target_position + forward:Scaled(double_radius - 5)
+										local front_position = event.double_base_position
+											+ event.double_forward:Scaled(double_radius - 5)
 										local double_cast_range = Ability.GetCastRange(double_field)
 										local double_distance = Entity.GetAbsOrigin(unit):Distance2D(front_position)
 										if double_cast_range > 0 and double_distance <= double_cast_range then
