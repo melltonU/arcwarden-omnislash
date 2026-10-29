@@ -320,7 +320,9 @@ local localization = qLocalization.new({
 	en = {
 		aw_group_main = "Omnislash defense",
 		aw_enable = "Auto Magnetic Field",
-		aw_enable_tip = "Casts Magnetic Field just behind you when a nearby enemy Juggernaut starts Omnislash.\nA nearby Tempest Double casts a second field on the opposite side.",
+		aw_enable_tip = "Automatically places Magnetic Field when an enemy Juggernaut starts Omnislash.\nA nearby Tempest Double can cast a second field on the opposite side.",
+		aw_ally = "Protect allies",
+		aw_ally_tip = "When enabled, protect the confirmed Omnislash target.\nWhen disabled, protect Arc Warden only when he is the confirmed target.",
 		aw_gear_extra = "Options",
 		aw_debug = "Debug log",
 		aw_debug_tip = "Logs when the script activates, Magnetic Field becomes available, and an enemy Juggernaut starts Omnislash",
@@ -328,7 +330,9 @@ local localization = qLocalization.new({
 	ru = {
 		aw_group_main = "Защита от Омнислеша",
 		aw_enable = "Автокупол",
-		aw_enable_tip = "Ставит поле за вашей спиной при начале Омнислеша вражеским Джаггернаутом рядом.\nБлизкий Tempest Double ставит второе поле с противоположной стороны.",
+		aw_enable_tip = "Автоматически ставит Magnetic Field при начале Омнислеша вражеским Джаггернаутом.\nБлизкий Tempest Double может поставить второе поле с противоположной стороны.",
+		aw_ally = "Защищать союзников",
+		aw_ally_tip = "Если включено, защищает подтверждённую цель Омнислеша.\nЕсли выключено, защищает Арка только когда он точно является целью.",
 		aw_gear_extra = "Настройки",
 		aw_debug = "Отладка в лог",
 		aw_debug_tip = "Пишет в лог включение скрипта, готовность купола и обнаружение начала Омнислеша",
@@ -352,6 +356,8 @@ do
 	ui.hero_enable = Menu.Find("Heroes", "Hero List", "Arc Warden", "Main Settings", "Hero Settings", "Enable")
 	ui.enable = group:Switch("aw_enable", false, "\u{f011}")
 	ui.enable:ToolTip("aw_enable_tip")
+	ui.ally = group:Switch("aw_ally", false, "\u{f05b}")
+	ui.ally:ToolTip("aw_ally_tip")
 	local gear = ui.enable:Gear("aw_gear_extra")
 	ui.debug = gear:Switch("aw_debug", true, "\u{f188}")
 	ui.debug:ToolTip("aw_debug_tip")
@@ -363,6 +369,7 @@ end
 
 local function refresh_disabled()
 	local on = active()
+	ui.ally:Disabled(not on)
 	ui.debug:Disabled(not on)
 end
 
@@ -376,12 +383,56 @@ end
 
 local state = {
 	next_scan_time = 0,
-	enemy_phases = {},
 	omni_events = {},
+	enemy_casts = {},
+	order_targets = {},
+	modifier_targets = {},
 	active = false,
 	hero_valid = nil,
 	field_ready = nil,
 }
+
+local function valid_ally_target(target, team)
+	return target ~= nil
+		and Entity.IsEntity(target)
+		and Entity.IsHero(target)
+		and Entity.IsAlive(target)
+		and Entity.GetTeamNum(target) == team
+end
+
+local function find_omni_target(enemy, team, local_hero, ordered_target, modifier_target)
+	local enemy_position = Entity.GetAbsOrigin(enemy)
+	local target = nil
+	local source = nil
+	if valid_ally_target(ordered_target, team) then
+		target = ordered_target
+		source = "order"
+	elseif valid_ally_target(modifier_target, team) then
+		target = modifier_target
+		source = "target_modifier"
+	else
+		for _, modifier in ipairs(NPC.GetModifiers(enemy)) do
+			if string.find(Modifier.GetName(modifier), "omni", 1, true) then
+				local modifier_field_target = Modifier.GetField(modifier, "m_hTarget")
+				if valid_ally_target(modifier_field_target, team) then
+					target = modifier_field_target
+					source = "modifier"
+					break
+				end
+			end
+		end
+	end
+
+	if target == nil then
+		return nil, nil, "target_unknown"
+	end
+
+	if not ui.ally:Get() and target ~= local_hero then
+		return nil, nil, "other_target"
+	end
+
+	return target, enemy_position:Distance2D(Entity.GetAbsOrigin(target)), source
+end
 
 local script = {}
 
@@ -391,8 +442,10 @@ function script.OnUpdate()
 			log("Automation paused")
 		end
 		state.active = false
-		state.enemy_phases = {}
 		state.omni_events = {}
+		state.enemy_casts = {}
+		state.order_targets = {}
+		state.modifier_targets = {}
 		return
 	end
 	if not state.active then
@@ -408,8 +461,10 @@ function script.OnUpdate()
 		log(hero_valid and "Arc Warden detected" or "Waiting for Arc Warden")
 	end
 	if not hero_valid then
-		state.enemy_phases = {}
 		state.omni_events = {}
+		state.enemy_casts = {}
+		state.order_targets = {}
+		state.modifier_targets = {}
 		return
 	end
 
@@ -435,31 +490,62 @@ function script.OnUpdate()
 			if omnislash ~= nil then
 				local casting = Ability.IsInAbilityPhase(omnislash)
 				local enemy_index = Entity.GetIndex(enemy)
-				local was_casting = state.enemy_phases[enemy_index] == true
-				state.enemy_phases[enemy_index] = casting
-
 				local cast_range = Ability.GetCastRange(omnislash)
-				local slash_radius = Ability.GetLevelSpecialValueFor(omnislash, "omni_slash_radius")
-				local danger_range = cast_range + slash_radius
 				local event = state.omni_events[enemy_index]
-				if casting and not was_casting then
-					local in_range = danger_range > 0
-						and NPC.IsEntityInRange(hero, enemy, danger_range)
+				local cast_state = state.enemy_casts[enemy_index]
+				local new_cast = casting and (cast_state == nil or not cast_state.was_casting)
+				if cast_state ~= nil then
+					cast_state.was_casting = casting
+				end
+
+				if new_cast then
+					local order_target = state.order_targets[enemy_index]
+					if order_target ~= nil and now > order_target.expires_at then
+						order_target = nil
+					end
+					local modifier_target = state.modifier_targets[enemy_index]
+					if modifier_target ~= nil and now > modifier_target.expires_at then
+						modifier_target = nil
+					end
+					local target, target_distance, target_source = find_omni_target(
+						enemy,
+						hero_team,
+						hero,
+						order_target and order_target.target or nil,
+						modifier_target and modifier_target.target or nil
+					)
+					local cast_count = cast_state ~= nil and cast_state.count + 1 or 1
+					state.enemy_casts[enemy_index] = {
+						count = cast_count,
+						was_casting = true,
+					}
 					log(string.format(
-						"Omnislash phase detected: field_ready=%s, danger_range=%.0f, in_range=%s",
+						"Omnislash #%d detected: field_ready=%s, target=%s, distance=%s",
+						cast_count,
 						tostring(field_ready),
-						danger_range,
-						tostring(in_range)
+						target_source,
+						target_distance and string.format("%.0f", target_distance) or "none"
 					))
-					if in_range then
-						local window = Ability.GetCastPoint(omnislash)
-							+ Ability.GetLevelSpecialValueFor(omnislash, "duration")
-						event = {
-							expires_at = now + window + 0.25,
-							hero_cast = false,
-							double_cast = false,
-						}
-						state.omni_events[enemy_index] = event
+					local window = Ability.GetCastPoint(omnislash)
+						+ Ability.GetLevelSpecialValueFor(omnislash, "duration")
+					local delay = cast_count > 1 and 0.3 or 0
+					event = {
+						cast_at = now + delay,
+						expires_at = now + delay + window + 0.25,
+						target_deadline = now + delay + 0.5,
+						target = target,
+						target_resolved = target_source == "other_target",
+						hero_cast = false,
+						double_cast = false,
+					}
+					state.omni_events[enemy_index] = event
+					if event.target_resolved then
+						log("Omnislash is targeting another ally; ally protection is disabled")
+						state.order_targets[enemy_index] = nil
+						state.modifier_targets[enemy_index] = nil
+					elseif target ~= nil then
+						state.order_targets[enemy_index] = nil
+						state.modifier_targets[enemy_index] = nil
 					end
 				end
 
@@ -468,16 +554,72 @@ function script.OnUpdate()
 					event = nil
 				end
 
-				if event ~= nil then
-					local hero_position = Entity.GetAbsOrigin(hero)
-					local forward = Entity.GetRotation(hero):GetForward():Normalized()
+				if event ~= nil and event.target == nil and not event.target_resolved then
+					local order_target = state.order_targets[enemy_index]
+					if order_target ~= nil and now > order_target.expires_at then
+						state.order_targets[enemy_index] = nil
+						order_target = nil
+					end
+					local modifier_target = state.modifier_targets[enemy_index]
+					if modifier_target ~= nil and now > modifier_target.expires_at then
+						state.modifier_targets[enemy_index] = nil
+						modifier_target = nil
+					end
+					local target, target_distance, target_source = find_omni_target(
+						enemy,
+						hero_team,
+						hero,
+						order_target and order_target.target or nil,
+						modifier_target and modifier_target.target or nil
+					)
+					if target ~= nil then
+						event.target = target
+						log(string.format(
+							"Omnislash target confirmed: source=%s, distance=%.0f",
+							target_source,
+							target_distance
+						))
+						state.order_targets[enemy_index] = nil
+						state.modifier_targets[enemy_index] = nil
+					elseif target_source == "other_target" then
+						event.target_resolved = true
+						log("Omnislash is targeting another ally; ally protection is disabled")
+						state.order_targets[enemy_index] = nil
+						state.modifier_targets[enemy_index] = nil
+					elseif now >= event.target_deadline then
+						event.target_resolved = true
+						log("Omnislash target could not be confirmed; skipping Magnetic Field")
+					end
+				end
+
+				if event ~= nil and event.target ~= nil and not Entity.IsAlive(event.target) then
+					event.target = nil
+					event.target_lost = true
+					log("Omnislash target is no longer alive")
+				end
+
+				if event ~= nil and event.target ~= nil and now >= event.cast_at then
+					local target = event.target
+					local target_position = Entity.GetAbsOrigin(target)
+					local forward = Entity.GetRotation(target):GetForward():Normalized()
 
 					if field_ready and not event.hero_cast then
 						local field_radius = Ability.GetLevelSpecialValueFor(field, "radius")
-						local back_position = hero_position - forward:Scaled(field_radius - 5)
-						Ability.CastPosition(field, back_position)
-						event.hero_cast = true
-						log("Cast Magnetic Field behind Arc Warden")
+						local back_position = target_position - forward:Scaled(field_radius - 5)
+						local cast_range = Ability.GetCastRange(field)
+						local cast_distance = Entity.GetAbsOrigin(hero):Distance2D(back_position)
+						if cast_range > 0 and cast_distance <= cast_range then
+							Ability.CastPosition(field, back_position)
+							event.hero_cast = true
+							log("Cast Magnetic Field behind Omnislash target")
+						elseif event.hero_status ~= "out_of_range" then
+							event.hero_status = "out_of_range"
+							log(string.format(
+								"Target field out of Arc Warden cast range: distance=%.0f, range=%.0f",
+								cast_distance,
+								cast_range
+							))
+						end
 					end
 
 					if not event.double_cast then
@@ -502,7 +644,7 @@ function script.OnUpdate()
 										double_issue = "unavailable"
 									else
 										local double_radius = Ability.GetLevelSpecialValueFor(double_field, "radius")
-										local front_position = hero_position + forward:Scaled(double_radius - 5)
+										local front_position = target_position + forward:Scaled(double_radius - 5)
 										local double_cast_range = Ability.GetCastRange(double_field)
 										local double_distance = Entity.GetAbsOrigin(unit):Distance2D(front_position)
 										if double_cast_range > 0 and double_distance <= double_cast_range then
@@ -543,6 +685,51 @@ function script.OnUpdate()
 			end
 		end
 	end
+end
+
+function script.OnPrepareUnitOrders(data)
+	if not active() or data.ability == nil or data.npc == nil then
+		return true
+	end
+	if Ability.GetName(data.ability) ~= "juggernaut_omni_slash"
+		or not Entity.IsNPC(data.npc)
+		or NPC.GetUnitName(data.npc) ~= "npc_dota_hero_juggernaut" then
+		return true
+	end
+
+	local hero = Heroes.GetLocal()
+	if hero ~= nil and Entity.GetTeamNum(data.npc) ~= Entity.GetTeamNum(hero)
+		and data.target ~= nil and Entity.IsEntity(data.target) then
+		local enemy_index = Entity.GetIndex(data.npc)
+		state.order_targets[enemy_index] = {
+			target = data.target,
+			expires_at = GameRules.GetGameTime() + Ability.GetCastPoint(data.ability) + 0.5,
+		}
+	end
+
+	return true
+end
+
+function script.OnModifierCreate(entity, modifier)
+	if not active() then return end
+
+	local ability = Modifier.GetAbility(modifier)
+	if ability == nil or Ability.GetName(ability) ~= "juggernaut_omni_slash" then return end
+
+	local caster = Modifier.GetCaster(modifier)
+	if caster == nil or NPC.GetUnitName(caster) ~= "npc_dota_hero_juggernaut"
+		or entity == caster or not Entity.IsHero(entity) then
+		return
+	end
+
+	local hero = Heroes.GetLocal()
+	if hero == nil or Entity.GetTeamNum(entity) ~= Entity.GetTeamNum(hero) then return end
+
+	local enemy_index = Entity.GetIndex(caster)
+	state.modifier_targets[enemy_index] = {
+		target = entity,
+		expires_at = GameRules.GetGameTime() + Ability.GetCastPoint(ability) + 0.5,
+	}
 end
 
 return script
